@@ -139,7 +139,15 @@ function defaultNow(): string {
 
 function topicName(body: ConnectBody): string {
   const identity = body.identity ?? {};
-  let base = identity.name || identity.email || body.visitorId;
+  const company = String(identity.company ?? '').trim();
+  const person = String(identity.name || identity.email || body.visitorId || '').trim();
+  // If name already looks like "Company · Person", keep it; else build that form.
+  let base = person;
+  if (company && person && !person.includes(company)) {
+    base = `${company} · ${person}`;
+  } else if (company && !person) {
+    base = company;
+  }
   const city = body.metadata?.city;
   if (city) base = `${base} · ${city}`;
   // Telegram caps forum topic names at 128 chars.
@@ -233,8 +241,9 @@ export async function handleConnect(
   // Post a "new chat" notice into the topic.
   const lines = ['🆕 <b>New chat</b>'];
   const identity = body.identity ?? {};
-  if (identity.name) lines.push(`👤 ${escapeHtml(identity.name)}`);
-  if (identity.email) lines.push(`✉️ ${escapeHtml(identity.email)}`);
+  if (identity.company) lines.push(`🏢 ${escapeHtml(String(identity.company))}`);
+  if (identity.name) lines.push(`👤 ${escapeHtml(String(identity.name))}`);
+  if (identity.email) lines.push(`✉️ ${escapeHtml(String(identity.email))}`);
   if (body.metadata?.url) lines.push(`🔗 ${escapeHtml(body.metadata.url)}`);
   if (body.metadata?.referrer) lines.push(`↩️ ${escapeHtml(body.metadata.referrer)}`);
   await deps.telegram.sendMessage(env.TELEGRAM_GROUP_ID, lines.join('\n'), {
