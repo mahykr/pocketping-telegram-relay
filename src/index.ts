@@ -80,6 +80,7 @@ interface MessageBody {
 /** Telegram client surface — default impl uses fetch, tests inject a mock. */
 export interface TelegramClient {
   createForumTopic(chatId: string, name: string): Promise<{ message_thread_id: number }>;
+  editForumTopic?(chatId: string, threadId: number, name: string): Promise<void>;
   sendMessage(
     chatId: string,
     text: string,
@@ -154,6 +155,38 @@ function topicName(body: ConnectBody): string {
   return String(base).slice(0, 128);
 }
 
+/** Random visitor ids must not stay as the topic title once we know the person. */
+function topicLooksNamed(name: string, visitorId: string): boolean {
+  const title = name.trim();
+  if (!title) return false;
+  if (title === visitorId) return false;
+  if (visitorId && title.startsWith(visitorId)) return false;
+  return true;
+}
+
+async function renameExistingTopic(
+  env: Env,
+  deps: Deps,
+  sessionJson: string,
+  body: ConnectBody
+): Promise<void> {
+  if (!deps.telegram.editForumTopic) return;
+  const title = topicName(body);
+  if (!topicLooksNamed(title, body.visitorId || '')) return;
+  let session: SessionRecord;
+  try {
+    session = JSON.parse(sessionJson) as SessionRecord;
+  } catch {
+    return;
+  }
+  if (!session.topicId) return;
+  try {
+    await deps.telegram.editForumTopic(env.TELEGRAM_GROUP_ID, session.topicId, title);
+  } catch {
+    // Chat must keep working even if Telegram refuses the rename.
+  }
+}
+
 async function readMessages(env: Env, sessionId: string): Promise<RelayMessage[]> {
   const raw = await env.PP.get(KEY.msgs(sessionId));
   if (!raw) return [];
@@ -197,6 +230,7 @@ export async function handleConnect(
   if (body.sessionId) {
     const rec = await env.PP.get(KEY.sess(body.sessionId));
     if (rec) {
+      await renameExistingTopic(env, deps, rec, body);
       const messages = await readMessages(env, body.sessionId);
       return {
         sessionId: body.sessionId,
@@ -213,6 +247,7 @@ export async function handleConnect(
     if (existingSessionId) {
       const rec = await env.PP.get(KEY.sess(existingSessionId));
       if (rec) {
+        await renameExistingTopic(env, deps, rec, body);
         const messages = await readMessages(env, existingSessionId);
         return {
           sessionId: existingSessionId,
@@ -418,6 +453,13 @@ export function makeTelegramClient(token: string): TelegramClient {
     createForumTopic(chatId, name) {
       return call('createForumTopic', { chat_id: chatId, name });
     },
+    editForumTopic(chatId, threadId, name) {
+      return call('editForumTopic', {
+        chat_id: chatId,
+        message_thread_id: threadId,
+        name,
+      });
+    },
     sendMessage(chatId, text, opts) {
       return call('sendMessage', {
         chat_id: chatId,
@@ -436,12 +478,37 @@ export function makeTelegramClient(token: string): TelegramClient {
 const NOOP_POST_PATHS = new Set([
   '/typing',
   '/read',
-  '/identify',
   '/presence',
   '/disconnect',
   '/visibility',
   '/prechat',
 ]);
+
+interface IdentifyBody {
+  sessionId?: string;
+  identity?: ConnectBody['identity'];
+}
+
+export async function handleIdentify(
+  body: IdentifyBody,
+  env: Env,
+  deps: Deps
+): Promise<{ ok: true }> {
+  if (!body.sessionId || !body.identity) return { ok: true };
+  const rec = await env.PP.get(KEY.sess(body.sessionId));
+  if (!rec) return { ok: true };
+  let visitorId = '';
+  try {
+    visitorId = String((JSON.parse(rec) as SessionRecord).visitorId || '');
+  } catch {
+    visitorId = '';
+  }
+  await renameExistingTopic(env, deps, rec, {
+    visitorId,
+    identity: body.identity,
+  });
+  return { ok: true };
+}
 
 async function parseJson<T>(request: Request): Promise<T> {
   try {
@@ -486,6 +553,11 @@ export async function route(request: Request, env: Env, deps: Deps): Promise<Res
     if (method === 'POST' && path === '/connect') {
       const body = await parseJson<ConnectBody>(request);
       return json(await handleConnect(body, env, deps));
+    }
+
+    if (method === 'POST' && path === '/identify') {
+      const body = await parseJson<IdentifyBody>(request);
+      return json(await handleIdentify(body, env, deps));
     }
 
     if (method === 'POST' && path === '/message') {
