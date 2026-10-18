@@ -156,6 +156,39 @@ describe('handleConnect', () => {
     expect(again.sessionId).toBe(first.sessionId);
     expect(calls).toHaveLength(0);
   });
+
+  it('switching company after a chat does not touch Telegram until next message', async () => {
+    const { client, calls } = makeMockTelegram({ topicId: 50 });
+    const deps = makeDeps(client);
+    const first = await handleConnect(
+      {
+        visitorId: 'v-switch',
+        identity: { id: 'u1-c21', name: 'Яковлев · a@b.c', company: 'ИП Яковлев', email: 'a@b.c' },
+      },
+      env,
+      deps
+    );
+    await handleMessage({ sessionId: first.sessionId, content: 'hi' }, env, deps);
+    const afterFirst = calls.length;
+    expect(afterFirst).toBeGreaterThan(0);
+
+    calls.length = 0;
+    await handleConnect(
+      {
+        visitorId: 'v-switch',
+        sessionId: first.sessionId,
+        identity: { id: 'u1-c17', name: 'YUSKISS · a@b.c', company: 'YUSKISS', email: 'a@b.c' },
+      },
+      env,
+      deps
+    );
+    expect(calls).toHaveLength(0);
+
+    const kv = env.PP as MemoryKV;
+    const sess = JSON.parse((await kv.get(`sess:${first.sessionId}`))!);
+    expect(sess.topicId).toBeUndefined();
+    expect(sess.identity.company).toBe('YUSKISS');
+  });
 });
 
 describe('handleMessage', () => {
@@ -336,7 +369,11 @@ describe('route / CORS', () => {
     );
     expect(res.status).toBe(200);
     expect(res.headers.get('Access-Control-Allow-Origin')).toBe('*');
-    expect(await res.json()).toEqual({ status: 'ok' });
+    expect(await res.json()).toMatchObject({
+      status: 'ok',
+      build: 'lazy-v2-no-tg-until-message',
+      telegram: { create: 0, edit: 0, send: 0 },
+    });
   });
 
   it('POST /typing is an accepted no-op returning { ok: true }', async () => {

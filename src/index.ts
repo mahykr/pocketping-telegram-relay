@@ -111,7 +111,44 @@ const KEY = {
   topic: (topicId: number | string) => `topic:${topicId}`,
   vis: (visitorId: string) => `vis:${visitorId}`,
   msgs: (sessionId: string) => `msgs:${sessionId}`,
+  tgStats: 'stats:telegram',
 };
+
+/** Bump only after this deploy is live — used for prod verification. */
+export const WORKER_BUILD = 'lazy-v2-no-tg-until-message';
+
+export type TelegramStats = {
+  create: number;
+  edit: number;
+  send: number;
+  updatedAt?: string;
+};
+
+async function readTelegramStats(env: Env): Promise<TelegramStats> {
+  const raw = await env.PP.get(KEY.tgStats);
+  if (!raw) return { create: 0, edit: 0, send: 0 };
+  try {
+    const parsed = JSON.parse(raw) as TelegramStats;
+    return {
+      create: Number(parsed.create || 0),
+      edit: Number(parsed.edit || 0),
+      send: Number(parsed.send || 0),
+      updatedAt: parsed.updatedAt,
+    };
+  } catch {
+    return { create: 0, edit: 0, send: 0 };
+  }
+}
+
+async function bumpTelegramStat(
+  env: Env,
+  field: 'create' | 'edit' | 'send'
+): Promise<void> {
+  const stats = await readTelegramStats(env);
+  stats[field] = Number(stats[field] || 0) + 1;
+  stats.updatedAt = new Date().toISOString();
+  await env.PP.put(KEY.tgStats, JSON.stringify(stats));
+}
 
 export function corsHeaders(): Record<string, string> {
   return {
@@ -251,6 +288,16 @@ async function mergeIdentityOnSession(
   }
   let changed = false;
   if (body.identity) {
+    const prevId = String((session.identity && session.identity.id) || '');
+    const prevCompany = String((session.identity && session.identity.company) || '');
+    const nextId = String(body.identity.id || '');
+    const nextCompany = String(body.identity.company || '');
+    // Company/user changed: detach old Telegram topic. Do NOT rename it.
+    // Next message will open a fresh topic for the new company.
+    if (session.topicId && ((nextId && nextId !== prevId) || (nextCompany && nextCompany !== prevCompany))) {
+      session.topicId = undefined;
+      changed = true;
+    }
     session.identity = { ...(session.identity || {}), ...body.identity };
     changed = true;
   }
@@ -307,8 +354,7 @@ export async function handleConnect(
   if (body.sessionId) {
     const rec = await env.PP.get(KEY.sess(body.sessionId));
     if (rec) {
-      const next = await mergeIdentityOnSession(env, body.sessionId, rec, body);
-      await renameExistingTopic(env, deps, next, body);
+      await mergeIdentityOnSession(env, body.sessionId, rec, body);
       const messages = await readMessages(env, body.sessionId);
       return {
         sessionId: body.sessionId,
@@ -325,8 +371,7 @@ export async function handleConnect(
     if (existingSessionId) {
       const rec = await env.PP.get(KEY.sess(existingSessionId));
       if (rec) {
-        const next = await mergeIdentityOnSession(env, existingSessionId, rec, body);
-        await renameExistingTopic(env, deps, next, body);
+        await mergeIdentityOnSession(env, existingSessionId, rec, body);
         const messages = await readMessages(env, existingSessionId);
         return {
           sessionId: existingSessionId,
@@ -498,7 +543,7 @@ export class RelayError extends Error {
 // Default Telegram client (uses fetch). Not exercised by unit tests.
 // ─────────────────────────────────────────────────────────────────────────
 
-export function makeTelegramClient(token: string): TelegramClient {
+export function makeTelegramClient(token: string, env?: Env): TelegramClient {
   const base = `https://api.telegram.org/bot${token}`;
 
   async function call<T>(method: string, payload: unknown): Promise<T> {
@@ -515,23 +560,31 @@ export function makeTelegramClient(token: string): TelegramClient {
   }
 
   return {
-    createForumTopic(chatId, name) {
-      return call('createForumTopic', { chat_id: chatId, name });
+    async createForumTopic(chatId, name) {
+      const result = await call<{ message_thread_id: number }>('createForumTopic', {
+        chat_id: chatId,
+        name,
+      });
+      if (env) await bumpTelegramStat(env, 'create');
+      return result;
     },
-    editForumTopic(chatId, threadId, name) {
-      return call('editForumTopic', {
+    async editForumTopic(chatId, threadId, name) {
+      await call('editForumTopic', {
         chat_id: chatId,
         message_thread_id: threadId,
         name,
       });
+      if (env) await bumpTelegramStat(env, 'edit');
     },
-    sendMessage(chatId, text, opts) {
-      return call('sendMessage', {
+    async sendMessage(chatId, text, opts) {
+      const result = await call<{ message_id: number }>('sendMessage', {
         chat_id: chatId,
         text,
         message_thread_id: opts.message_thread_id,
         parse_mode: opts.parse_mode,
       });
+      if (env) await bumpTelegramStat(env, 'send');
+      return result;
     },
   };
 }
@@ -557,23 +610,13 @@ interface IdentifyBody {
 export async function handleIdentify(
   body: IdentifyBody,
   env: Env,
-  deps: Deps
+  _deps: Deps
 ): Promise<{ ok: true }> {
   if (!body.sessionId || !body.identity) return { ok: true };
   const rec = await env.PP.get(KEY.sess(body.sessionId));
   if (!rec) return { ok: true };
-  const next = await mergeIdentityOnSession(env, body.sessionId, rec, {
+  await mergeIdentityOnSession(env, body.sessionId, rec, {
     visitorId: '',
-    identity: body.identity,
-  });
-  let visitorId = '';
-  try {
-    visitorId = String((JSON.parse(next) as SessionRecord).visitorId || '');
-  } catch {
-    visitorId = '';
-  }
-  await renameExistingTopic(env, deps, next, {
-    visitorId,
     identity: body.identity,
   });
   return { ok: true };
@@ -599,7 +642,8 @@ export async function route(request: Request, env: Env, deps: Deps): Promise<Res
   try {
     // Health.
     if (method === 'GET' && path === '/health') {
-      return json({ status: 'ok' });
+      const telegram = await readTelegramStats(env);
+      return json({ status: 'ok', build: WORKER_BUILD, telegram });
     }
 
     // Polling path (primary).
@@ -667,7 +711,7 @@ export async function route(request: Request, env: Env, deps: Deps): Promise<Res
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const deps: Deps = { telegram: makeTelegramClient(env.TELEGRAM_BOT_TOKEN) };
+    const deps: Deps = { telegram: makeTelegramClient(env.TELEGRAM_BOT_TOKEN, env) };
     return route(request, env, deps);
   },
 };
