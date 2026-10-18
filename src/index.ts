@@ -51,8 +51,11 @@ export interface RelayMessage {
 
 interface SessionRecord {
   visitorId: string;
-  topicId: number;
+  /** 0 / missing until the visitor sends the first message. */
+  topicId?: number;
   createdAt: string;
+  identity?: ConnectBody['identity'];
+  metadata?: ConnectBody['metadata'];
 }
 
 interface ConnectBody {
@@ -187,6 +190,80 @@ async function renameExistingTopic(
   }
 }
 
+async function persistSession(
+  env: Env,
+  sessionId: string,
+  session: SessionRecord
+): Promise<void> {
+  await env.PP.put(KEY.sess(sessionId), JSON.stringify(session));
+}
+
+/** Create Telegram topic only when the visitor actually wrote something. */
+async function ensureTelegramTopic(
+  env: Env,
+  deps: Deps,
+  sessionId: string,
+  session: SessionRecord
+): Promise<SessionRecord> {
+  if (session.topicId) return session;
+
+  const body: ConnectBody = {
+    visitorId: session.visitorId,
+    identity: session.identity,
+    metadata: session.metadata,
+  };
+  const topic = await deps.telegram.createForumTopic(
+    env.TELEGRAM_GROUP_ID,
+    topicName(body)
+  );
+  const topicId = topic.message_thread_id;
+  session.topicId = topicId;
+  await persistSession(env, sessionId, session);
+  await env.PP.put(KEY.topic(topicId), sessionId);
+
+  const lines = ['🆕 <b>New chat</b>'];
+  const identity = session.identity ?? {};
+  if (identity.company) lines.push(`🏢 ${escapeHtml(String(identity.company))}`);
+  if (identity.name) lines.push(`👤 ${escapeHtml(String(identity.name))}`);
+  if (identity.email) lines.push(`✉️ ${escapeHtml(String(identity.email))}`);
+  if (session.metadata?.url) lines.push(`🔗 ${escapeHtml(String(session.metadata.url))}`);
+  if (session.metadata?.referrer) {
+    lines.push(`↩️ ${escapeHtml(String(session.metadata.referrer))}`);
+  }
+  await deps.telegram.sendMessage(env.TELEGRAM_GROUP_ID, lines.join('\n'), {
+    message_thread_id: topicId,
+    parse_mode: 'HTML',
+  });
+  return session;
+}
+
+async function mergeIdentityOnSession(
+  env: Env,
+  sessionId: string,
+  rec: string,
+  body: ConnectBody
+): Promise<string> {
+  let session: SessionRecord;
+  try {
+    session = JSON.parse(rec) as SessionRecord;
+  } catch {
+    return rec;
+  }
+  let changed = false;
+  if (body.identity) {
+    session.identity = { ...(session.identity || {}), ...body.identity };
+    changed = true;
+  }
+  if (body.metadata) {
+    session.metadata = { ...(session.metadata || {}), ...body.metadata };
+    changed = true;
+  }
+  if (!changed) return rec;
+  const next = JSON.stringify(session);
+  await env.PP.put(KEY.sess(sessionId), next);
+  return next;
+}
+
 async function readMessages(env: Env, sessionId: string): Promise<RelayMessage[]> {
   const raw = await env.PP.get(KEY.msgs(sessionId));
   if (!raw) return [];
@@ -230,7 +307,8 @@ export async function handleConnect(
   if (body.sessionId) {
     const rec = await env.PP.get(KEY.sess(body.sessionId));
     if (rec) {
-      await renameExistingTopic(env, deps, rec, body);
+      const next = await mergeIdentityOnSession(env, body.sessionId, rec, body);
+      await renameExistingTopic(env, deps, next, body);
       const messages = await readMessages(env, body.sessionId);
       return {
         sessionId: body.sessionId,
@@ -247,7 +325,8 @@ export async function handleConnect(
     if (existingSessionId) {
       const rec = await env.PP.get(KEY.sess(existingSessionId));
       if (rec) {
-        await renameExistingTopic(env, deps, rec, body);
+        const next = await mergeIdentityOnSession(env, existingSessionId, rec, body);
+        await renameExistingTopic(env, deps, next, body);
         const messages = await readMessages(env, existingSessionId);
         return {
           sessionId: existingSessionId,
@@ -259,32 +338,16 @@ export async function handleConnect(
     }
   }
 
-  // 3) Create a brand-new session + Telegram forum topic.
+  // 3) Create a silent web session. Telegram topic waits for the first message.
   const sessionId = genId();
-  const topic = await deps.telegram.createForumTopic(
-    env.TELEGRAM_GROUP_ID,
-    topicName(body)
-  );
-  const topicId = topic.message_thread_id;
-  const createdAt = now();
-
-  const record: SessionRecord = { visitorId: body.visitorId, topicId, createdAt };
-  await env.PP.put(KEY.sess(sessionId), JSON.stringify(record));
-  await env.PP.put(KEY.topic(topicId), sessionId);
+  const record: SessionRecord = {
+    visitorId: body.visitorId,
+    createdAt: now(),
+    identity: body.identity,
+    metadata: body.metadata,
+  };
+  await persistSession(env, sessionId, record);
   if (body.visitorId) await env.PP.put(KEY.vis(body.visitorId), sessionId);
-
-  // Post a "new chat" notice into the topic.
-  const lines = ['🆕 <b>New chat</b>'];
-  const identity = body.identity ?? {};
-  if (identity.company) lines.push(`🏢 ${escapeHtml(String(identity.company))}`);
-  if (identity.name) lines.push(`👤 ${escapeHtml(String(identity.name))}`);
-  if (identity.email) lines.push(`✉️ ${escapeHtml(String(identity.email))}`);
-  if (body.metadata?.url) lines.push(`🔗 ${escapeHtml(body.metadata.url)}`);
-  if (body.metadata?.referrer) lines.push(`↩️ ${escapeHtml(body.metadata.referrer)}`);
-  await deps.telegram.sendMessage(env.TELEGRAM_GROUP_ID, lines.join('\n'), {
-    message_thread_id: topicId,
-    parse_mode: 'HTML',
-  });
 
   return { sessionId, visitorId: body.visitorId, operatorOnline: false, messages: [] };
 }
@@ -304,7 +367,9 @@ export async function handleMessage(
 
   const rec = await env.PP.get(KEY.sess(body.sessionId));
   if (!rec) throw new RelayError(404, 'unknown session');
-  const session: SessionRecord = JSON.parse(rec);
+  let session: SessionRecord = JSON.parse(rec);
+  session = await ensureTelegramTopic(env, deps, body.sessionId, session);
+  if (!session.topicId) throw new RelayError(502, 'failed to open Telegram topic');
 
   const messageId = genId();
   const timestamp = now();
@@ -497,13 +562,17 @@ export async function handleIdentify(
   if (!body.sessionId || !body.identity) return { ok: true };
   const rec = await env.PP.get(KEY.sess(body.sessionId));
   if (!rec) return { ok: true };
+  const next = await mergeIdentityOnSession(env, body.sessionId, rec, {
+    visitorId: '',
+    identity: body.identity,
+  });
   let visitorId = '';
   try {
-    visitorId = String((JSON.parse(rec) as SessionRecord).visitorId || '');
+    visitorId = String((JSON.parse(next) as SessionRecord).visitorId || '');
   } catch {
     visitorId = '';
   }
-  await renameExistingTopic(env, deps, rec, {
+  await renameExistingTopic(env, deps, next, {
     visitorId,
     identity: body.identity,
   });

@@ -87,7 +87,7 @@ describe('handleConnect', () => {
     env = makeEnv();
   });
 
-  it('creates a topic, persists mappings, and returns a sessionId', async () => {
+  it('creates a silent session without Telegram topic until first message', async () => {
     const { client, calls } = makeMockTelegram({ topicId: 42 });
     const deps = makeDeps(client);
 
@@ -106,22 +106,16 @@ describe('handleConnect', () => {
     expect(res.operatorOnline).toBe(false);
     expect(res.messages).toEqual([]);
 
-    // Telegram: createForumTopic then a "new chat" sendMessage.
-    expect(calls[0].method).toBe('createForumTopic');
-    expect(calls[0].args[1]).toBe('Jane Doe · Paris'); // name from identity + city
-    expect(calls[1].method).toBe('sendMessage');
-    const sendOpts = calls[1].args[2] as { message_thread_id: number };
-    expect(sendOpts.message_thread_id).toBe(42);
-    expect(calls[1].args[1]).toContain('New chat');
-    expect(calls[1].args[1]).toContain('jane@example.com');
-    expect(calls[1].args[1]).toContain('https://example.com/pricing');
+    // Opening the site must not ping Telegram.
+    expect(calls).toHaveLength(0);
 
-    // KV mappings persisted.
+    // KV session persisted without a topic yet.
     const kv = env.PP as MemoryKV;
     const sess = JSON.parse((await kv.get('sess:id-1'))!);
     expect(sess.visitorId).toBe('visitor-abc');
-    expect(sess.topicId).toBe(42);
-    expect(await kv.get('topic:42')).toBe('id-1');
+    expect(sess.topicId).toBeUndefined();
+    expect(sess.identity?.email).toBe('jane@example.com');
+    expect(await kv.get('topic:42')).toBeNull();
     expect(await kv.get('vis:visitor-abc')).toBe('id-1');
   });
 
@@ -165,13 +159,21 @@ describe('handleConnect', () => {
 });
 
 describe('handleMessage', () => {
-  it('sends to the right topic and returns messageId + ISO timestamp', async () => {
+  it('opens Telegram topic on first message, then sends there', async () => {
     const env = makeEnv();
     const { client, calls } = makeMockTelegram({ topicId: 77 });
     const deps = makeDeps(client);
 
-    const conn = await handleConnect({ visitorId: 'v2' }, env, deps);
-    calls.length = 0; // ignore connect calls
+    const conn = await handleConnect(
+      {
+        visitorId: 'v2',
+        identity: { name: 'Jane Doe', email: 'jane@example.com' },
+        metadata: { url: 'https://example.com/pricing', city: 'Paris' },
+      },
+      env,
+      deps
+    );
+    expect(calls).toHaveLength(0);
 
     const res = await handleMessage(
       { sessionId: conn.sessionId, content: 'Hello <script>', sender: 'visitor' },
@@ -183,13 +185,18 @@ describe('handleMessage', () => {
     expect(typeof res.timestamp).toBe('string');
     expect(() => new Date(res.timestamp).toISOString()).not.toThrow();
 
-    expect(calls).toHaveLength(1);
-    expect(calls[0].method).toBe('sendMessage');
-    const opts = calls[0].args[2] as { message_thread_id: number };
+    // First message: create topic + notice + visitor text.
+    expect(calls.map((c) => c.method)).toEqual([
+      'createForumTopic',
+      'sendMessage',
+      'sendMessage',
+    ]);
+    expect(calls[0].args[1]).toBe('Jane Doe · Paris');
+    expect(calls[1].args[1]).toContain('New chat');
+    const opts = calls[2].args[2] as { message_thread_id: number };
     expect(opts.message_thread_id).toBe(77);
-    // Content is HTML-escaped and prefixed with a visitor label.
-    expect(calls[0].args[1]).toContain('Visitor');
-    expect(calls[0].args[1]).toContain('Hello &lt;script&gt;');
+    expect(calls[2].args[1]).toContain('Visitor');
+    expect(calls[2].args[1]).toContain('Hello &lt;script&gt;');
   });
 
   it('throws 404 for an unknown session', async () => {
@@ -212,6 +219,8 @@ describe('handleTelegramWebhook', () => {
     deps = makeDeps(client);
     const conn = await handleConnect({ visitorId: 'v3' }, env, deps);
     sessionId = conn.sessionId;
+    // Topic mapping appears only after the first visitor message.
+    await handleMessage({ sessionId, content: 'hello', sender: 'visitor' }, env, deps);
   });
 
   it('maps a thread reply to the session queue', async () => {
@@ -352,7 +361,7 @@ describe('route / CORS', () => {
     expect(res.status).toBe(501);
   });
 
-  it('end-to-end: connect -> operator webhook -> messages polling via route()', async () => {
+  it('end-to-end: connect -> first message -> operator webhook -> polling', async () => {
     const env = makeEnv();
     const { client } = makeMockTelegram({ topicId: 555 });
     const d = makeDeps(client);
@@ -367,6 +376,15 @@ describe('route / CORS', () => {
     );
     const connect = (await connectRes.json()) as { sessionId: string };
     expect(connect.sessionId).toBeTruthy();
+
+    await route(
+      new Request('https://relay.workers.dev/message', {
+        method: 'POST',
+        body: JSON.stringify({ sessionId: connect.sessionId, content: 'hello' }),
+      }),
+      env,
+      d
+    );
 
     await route(
       new Request('https://relay.workers.dev/telegram-webhook', {
